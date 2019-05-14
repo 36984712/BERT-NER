@@ -61,7 +61,7 @@ class InputFeatures(object):
         self.label_id = label_id
 
 
-def readfile_ner(filename):
+def readfile(filename):
     '''
     read file
     return format :
@@ -90,34 +90,6 @@ def readfile_ner(filename):
     return data
 
 
-def readfile_pos(filename):
-    '''
-    read file
-    return format :
-    [ ['EU', 'NNP'], ['rejects', 'VBZ'], ['German', 'JJ'], ['call', 'NN'], ['to', 'TO'], ['boycott', 'VB'], ['British', 'JJ'], ['lamb', 'NN'], ['.', '.'] ]
-    '''
-    f = open(filename)
-    data = []
-    sentence = []
-    label = []
-    for line in f:
-        if len(line) == 0 or line.startswith('-DOCSTART') or line[0] == "\n":
-            if len(sentence) > 0:
-                data.append((sentence, label))
-                sentence = []
-                label = []
-            continue
-        splits = line.split(' ')
-        sentence.append(splits[0])
-        label.append(splits[1])
-
-    if len(sentence) > 0:
-        data.append((sentence, label))
-        sentence = []
-        label = []
-    return data
-
-
 class DataProcessor(object):
     """Base class for data converters for sequence classification data sets."""
 
@@ -136,7 +108,7 @@ class DataProcessor(object):
     @classmethod
     def _read_tsv(cls, input_file, quotechar=None):
         """Reads a tab separated value file."""
-        raise NotImplementedError()
+        return readfile(input_file)
 
 
 class NerProcessor(DataProcessor):
@@ -176,59 +148,6 @@ class NerProcessor(DataProcessor):
                              text_b=text_b,
                              label=label))
         return examples
-
-    @classmethod
-    def _read_tsv(cls, input_file, quotechar=None):
-        """Reads a tab separated value file."""
-        return readfile_ner(input_file)
-
-
-class PosProcessor(DataProcessor):
-    """Processor for the CoNLL-2003 data set."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.txt")), "train")
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "valid.txt")), "dev")
-
-    def get_test_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "test.txt")), "test")
-
-    def get_labels(self):
-        # total 45 + 3 = 48 types of labels
-        return [
-            'SYM', 'WP$', 'NNPS', 'RB', 'MD', 'PDT', 'POS', 'VBG', 'NNP', 'IN',
-            ',', 'RBS', 'EX', 'JJS', '.', 'PRP$', "''", ')', 'NN|SYM', 'PRP',
-            'WRB', 'NN', ':', 'VBZ', 'NNS', 'RBR', 'VBN', 'JJR', 'VBD', '$',
-            'LS', 'CD', 'VB', 'VBP', 'FW', 'WDT', 'WP', '"', 'UH', 'TO', 'RP',
-            'JJ', 'DT', '(', 'CC', 'X', '[CLS]', '[SEP]'
-        ]
-
-    def _create_examples(self, lines, set_type):
-        examples = []
-        for i, (sentence, label) in enumerate(lines):
-            guid = "%s-%s" % (set_type, i)
-            text_a = ' '.join(sentence)
-            text_b = None
-            label = label
-            examples.append(
-                InputExample(guid=guid,
-                             text_a=text_a,
-                             text_b=text_b,
-                             label=label))
-        return examples
-
-    @classmethod
-    def _read_tsv(cls, input_file, quotechar=None):
-        """Reads a tab separated value file."""
-        return readfile_pos(input_file)
 
 
 def convert_examples_to_features(examples, label_list, max_seq_length,
@@ -310,8 +229,7 @@ def main():
         default=None,
         type=str,
         required=True,
-        help=
-        "The input data dir. Should contain the .tsv files (or other data files) for the task."
+        help="The input data dir. Should contain the .tsv files (or other data files) for the task."
     )
     parser.add_argument(
         "--bert_model",
@@ -321,18 +239,18 @@ def main():
         help="Bert pre-trained model selected in the list: bert-base-uncased, "
         "bert-large-uncased, bert-base-cased, bert-large-cased, bert-base-multilingual-uncased, "
         "bert-base-multilingual-cased, bert-base-chinese.")
-    parser.add_argument("--task_name",
-                        default=None,
-                        type=str,
-                        required=True,
-                        help="The name of the task to train.")
+    parser.add_argument(
+        "--task_name",
+        default=None,
+        type=str,
+        required=True,
+        help="The name of the task to train.")
     parser.add_argument(
         "--output_dir",
         default=None,
         type=str,
         required=True,
-        help=
-        "The output directory where the model predictions and checkpoints will be written."
+        help="The output directory where the model predictions and checkpoints will be written."
     )
 
     # Other parameters
@@ -340,66 +258,71 @@ def main():
         "--cache_dir",
         default="",
         type=str,
-        help=
-        "Where do you want to store the pre-trained models downloaded from s3")
+        help="Where do you want to store the pre-trained models downloaded from s3")
     parser.add_argument(
         "--max_seq_length",
         default=128,
         type=int,
-        help=
-        "The maximum total input sequence length after WordPiece tokenization. \n"
-        "Sequences longer than this will be truncated, and sequences shorter \n"
-        "than this will be padded.")
-    parser.add_argument("--do_train",
-                        action='store_true',
-                        help="Whether to run training.")
-    parser.add_argument("--do_eval",
-                        action='store_true',
-                        help="Whether to run eval on the dev set.")
+        help="The maximum total input sequence length after WordPiece tokenization. \n"
+             "Sequences longer than this will be truncated, and sequences shorter \n"
+             "than this will be padded.")
+    parser.add_argument(
+        "--do_train",
+        action='store_true',
+        help="Whether to run training.")
+    parser.add_argument(
+        "--do_eval",
+        action='store_true',
+        help="Whether to run eval on the dev set.")
     parser.add_argument(
         "--do_lower_case",
         action='store_true',
         help="Set this flag if you are using an uncased model.")
-    parser.add_argument("--train_batch_size",
-                        default=32,
-                        type=int,
-                        help="Total batch size for training.")
-    parser.add_argument("--eval_batch_size",
-                        default=8,
-                        type=int,
-                        help="Total batch size for eval.")
-    parser.add_argument("--learning_rate",
-                        default=5e-5,
-                        type=float,
-                        help="The initial learning rate for Adam.")
-    parser.add_argument("--num_train_epochs",
-                        default=3.0,
-                        type=float,
-                        help="Total number of training epochs to perform.")
+    parser.add_argument(
+        "--train_batch_size",
+        default=32,
+        type=int,
+        help="Total batch size for training.")
+    parser.add_argument(
+        "--eval_batch_size",
+        default=8,
+        type=int,
+        help="Total batch size for eval.")
+    parser.add_argument(
+        "--learning_rate",
+        default=5e-5,
+        type=float,
+        help="The initial learning rate for Adam.")
+    parser.add_argument(
+        "--num_train_epochs",
+        default=3.0,
+        type=float,
+        help="Total number of training epochs to perform.")
     parser.add_argument(
         "--warmup_proportion",
         default=0.1,
         type=float,
-        help=
-        "Proportion of training to perform linear learning rate warmup for. "
-        "E.g., 0.1 = 10%% of training.")
-    parser.add_argument("--no_cuda",
-                        action='store_true',
-                        help="Whether not to use CUDA when available")
-    parser.add_argument("--local_rank",
-                        type=int,
-                        default=-1,
-                        help="local_rank for distributed training on gpus")
-    parser.add_argument('--seed',
-                        type=int,
-                        default=42,
-                        help="random seed for initialization")
+        help="Proportion of training to perform linear learning rate warmup for. "
+             "E.g., 0.1 = 10%% of training.")
+    parser.add_argument(
+        "--no_cuda",
+        action='store_true',
+        help="Whether not to use CUDA when available")
+    parser.add_argument(
+        "--local_rank",
+        type=int,
+        default=-1,
+        help="local_rank for distributed training on gpus")
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=42,
+        help="random seed for initialization")
     parser.add_argument(
         '--gradient_accumulation_steps',
         type=int,
         default=1,
-        help=
-        "Number of updates steps to accumulate before performing a backward/update pass."
+        help="Number of updates steps to accumulate before performing a backward/update pass."
     )
     parser.add_argument(
         '--fp16',
@@ -409,18 +332,19 @@ def main():
         '--loss_scale',
         type=float,
         default=0,
-        help=
-        "Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
-        "0 (default value): dynamic loss scaling.\n"
-        "Positive power of 2: static loss scaling value.\n")
-    parser.add_argument('--server_ip',
-                        type=str,
-                        default='',
-                        help="Can be used for distant debugging.")
-    parser.add_argument('--server_port',
-                        type=str,
-                        default='',
-                        help="Can be used for distant debugging.")
+        help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
+             "0 (default value): dynamic loss scaling.\n"
+             "Positive power of 2: static loss scaling value.\n")
+    parser.add_argument(
+        '--server_ip',
+        type=str,
+        default='',
+        help="Can be used for distant debugging.")
+    parser.add_argument(
+        '--server_port',
+        type=str,
+        default='',
+        help="Can be used for distant debugging.")
     args = parser.parse_args()
 
     if args.server_ip and args.server_port:
@@ -431,8 +355,7 @@ def main():
                             redirect_output=True)
         ptvsd.wait_for_attach()
 
-    processors = {"ner": NerProcessor,
-                  "pos": PosProcessor}
+    processors = {"ner": NerProcessor}
 
     if args.local_rank == -1 or args.no_cuda:
         device = torch.device("cuda" if torch.cuda.is_available()
