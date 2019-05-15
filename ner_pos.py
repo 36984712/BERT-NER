@@ -239,6 +239,7 @@ def main():
     if args.fp16:
         model.half()
     model.to(device)
+    model.ner_module.to(device)
     if args.local_rank != -1:
         try:
             from apex.parallel import DistributedDataParallel as DDP
