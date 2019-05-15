@@ -258,11 +258,17 @@ def main():
     global_step = 0
     nb_tr_steps = 0
     tr_loss = 0
+    if n_gpu > 1:
+        max_length = model.module.ner_module.model_config["max_seq_length"]
+        tokenizer = model.module.ner_module.tokenizer
+    else:
+        max_length = model.ner_module.model_config["max_seq_length"]
+        tokenizer = model.ner_module.tokenizer
     if args.do_train:
         train_features = convert_examples_to_features(train_examples,
                                                       label_list,
-                                                      model.ner_module.model_config["max_seq_length"],
-                                                      model.ner_module.tokenizer)
+                                                      max_length,
+                                                      tokenizer)
         logger.info("***** Running training *****")
         logger.info("  Num examples = %d", len(train_examples))
         logger.info("  Batch size = %d", args.train_batch_size)
@@ -353,8 +359,8 @@ def main():
                          or torch.distributed.get_rank() == 0):
         eval_examples = processor.get_dev_examples(args.data_dir)
         eval_features = convert_examples_to_features(eval_examples, label_list,
-                                                     model.ner_module.max_seq_length,
-                                                     model.ner_module.tokenizer)
+                                                     max_length,
+                                                     tokenizer)
         logger.info("***** Running evaluation *****")
         logger.info("  Num examples = %d", len(eval_examples))
         logger.info("  Batch size = %d", args.eval_batch_size)
