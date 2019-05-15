@@ -35,7 +35,8 @@ class Ner:
             config, num_labels=model_config["num_labels"])
         model.load_state_dict(torch.load(output_model_file))
         tokenizer = BertTokenizer.from_pretrained(model_config["bert_model"],
-                                                  do_lower_case=False)
+                                                  do_lower_case=model_config['do_lower'])
+                                                 # do_lower_case=False)
         return model, tokenizer, model_config
 
     def tokenize(self, text: str):
@@ -111,8 +112,8 @@ class Ner:
         return output
 
 
-model = Ner("out/")
+# model = Ner("out/")
 
-output = model.predict("Steve went to Paris")
+# output = model.predict("Steve went to Paris")
 
-print(output)
+# print(output)
