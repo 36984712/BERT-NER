@@ -22,6 +22,9 @@ class Ner:
         self.max_seq_length = self.model_config["max_seq_length"]
         self.label_map = {int(k): v for k, v in self.label_map.items()}
         self.model.eval()
+    
+    def to(self, device):
+        self.model.to(device)
 
     def load_model(self,
                    model_dir: str,
