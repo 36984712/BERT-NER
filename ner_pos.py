@@ -41,32 +41,49 @@ class ner2pos(nn.Module):
     def __init__(self, model_dir):
         super(ner2pos, self).__init__()
         self.ner_module = Ner(model_dir)
+        self.bert = self.ner_module.model.bert
+        self.config = self.bert.config
+        self.dropout = nn.Dropout(self.config.hidden_dropout_prob)
+        self.tokeniser = self.ner_module.tokenizer
         self.PosProcessor = PosProcessor()
         self.num_labels = len(self.PosProcessor.get_labels()) + 1
-        self.transfer = nn.Linear(self.ner_module.model_config["num_labels"], self.num_labels)
+        self.classifier = nn.Linear(self.config.hidden_size, self.num_labels)
 
-    def forward(self, input_ids, segment_ids, input_mask, labels=None):
-        # input_ids, input_mask, segment_ids, valid_positions = self.ner_module.preprocess(text)
-        # input_ids = torch.tensor([input_ids], dtype=torch.long)
-        # input_mask = torch.tensor([input_mask], dtype=torch.long)
-        # segment_ids = torch.tensor([segment_ids], dtype=torch.long)
-        with torch.no_grad():
-            logits_ner = self.ner_module.model(input_ids, segment_ids, input_mask)
-        logits_pos = self.transfer(logits_ner)
-        if labels is None:
-            return logits_pos
-        else:
+    def forward(self,
+                input_ids,
+                token_type_ids=None,
+                attention_mask=None,
+                labels=None):
+        # logger.info("token classification")
+        sequence_output, _ = self.bert(input_ids,
+                                       token_type_ids,
+                                       attention_mask,
+                                       output_all_encoded_layers=False)
+        sequence_output = self.dropout(sequence_output)
+        logits = self.classifier(sequence_output)
+        logits = F.relu(logits)
+        # print(logits.view(-1, self.num_labels))
+
+        if labels is not None:
             loss_fct = CrossEntropyLoss()
             # Only keep active parts of the loss
-            if input_mask is not None:
-                active_loss = input_mask.view(-1) == 1
-                active_logits = logits_pos.view(-1, self.num_labels)[active_loss]
+            if attention_mask is not None:
+                active_loss = attention_mask.view(-1) == 1
+                active_logits = logits.view(-1, self.num_labels)[active_loss]
                 active_labels = labels.view(-1)[active_loss]
                 loss = loss_fct(active_logits, active_labels)
             else:
-                loss = loss_fct(logits_pos.view(-1, self.num_labels),
+                loss = loss_fct(logits.view(-1, self.num_labels),
                                 labels.view(-1))
             return loss
+        else:
+            if attention_mask is not None:
+                active_loss = attention_mask.view(-1) == 1
+                active_logits = logits.view(-1, self.num_labels)[active_loss]
+                # active_labels = labels.view(-1)[active_loss]
+                return active_logits, active_loss
+            else:
+                return logits
 
 
 def main():
@@ -254,8 +271,19 @@ def main():
         model = torch.nn.DataParallel(model)
 
     # param_optimizer = list(model.named_parameters())
-    parms = list(model.named_parameters())
-    optimizer = optim.SGD(model.parameters(), lr=args.learning_rate)
+    param_optimizer = list(model.named_parameters())
+    optim_params = ['classifier.bias', 'classifier.weight']
+    optimizer_grouped_parameters = [{
+        'params':
+        [p for n, p in param_optimizer if any(nd in n for nd in optim_params)],
+        'weight_decay':
+        0.0
+    }]
+    # optimizer = optim.SGD(optimizer_grouped_parameters['params'], lr=args.learning_rate)
+    optimizer = BertAdam(optimizer_grouped_parameters,
+                         lr=args.learning_rate,
+                         warmup=args.warmup_proportion,
+                         t_total=num_train_optimization_steps)
     
     global_step = 0
     nb_tr_steps = 0
