@@ -115,8 +115,8 @@ class Ner:
         return output
 
 
-model = Ner("out/")
+# model = Ner("out/")
 
-output = model.predict("Alitalia Express S.p.A. was a regional airline based in Rome &#44; Italy and a wholly owned subsidiary of Alitalia .")
+# output = model.predict("Alitalia Express S.p.A. was a regional airline based in Rome &#44; Italy and a wholly owned subsidiary of Alitalia .")
 
-print(output)
+# print(output)
