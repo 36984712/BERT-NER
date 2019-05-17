@@ -1,39 +1,46 @@
-from __future__ import absolute_import, division, print_function
+from run_ner import DataProcessor
 
-import argparse
-import csv
-import logging
 import os
+import logging
+import argparse
 import random
-import json
-import sys
+from tqdm import tqdm, trange
 
-import numpy as np
 import torch
-import torch.nn.functional as F
-from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
-from pytorch_pretrained_bert.modeling import (CONFIG_NAME, WEIGHTS_NAME,
-                                              BertConfig,
-                                              BertForTokenClassification)
-from pytorch_pretrained_bert.optimization import BertAdam, warmup_linear
-from pytorch_pretrained_bert.tokenization import BertTokenizer
-from seqeval.metrics import classification_report
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
-from tqdm import tqdm, trange
+
+import numpy as np
+
+from pytorch_pretrained_bert.optimization import BertAdam, warmup_linear
+
+from relation_ex import relation_extracter
 
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
     datefmt='%m/%d/%Y %H:%M:%S',
     level=logging.INFO)
 logger = logging.getLogger(__name__)
+label_list = [
+    'I-Loc', 'B-Org', 'I-Org', 'B-Other', 'B-Peop', 'I-Peop', 'B-Loc', 'O',
+    'I-Other', '[CLS]', '[SEP]', 'X'
+]
+relation_list = [
+    'N', 'Live_In', 'Located_In', 'Work_For', 'OrgBased_In', 'Kill'
+]
 
 
 class InputExample(object):
     """A single training/test example for simple sequence classification."""
 
-    def __init__(self, guid, text_a, text_b=None, label=None):
+    def __init__(self,
+                 guid,
+                 text_a,
+                 text_b=None,
+                 label=None,
+                 relation=None,
+                 relation_object=None):
         """Constructs a InputExample.
 
         Args:
@@ -49,19 +56,25 @@ class InputExample(object):
         self.text_a = text_a
         self.text_b = text_b
         self.label = label
+        self.relation = relation
+        self.relation_object = relation_object
 
 
 class InputFeatures(object):
     """A single set of features of data."""
 
-    def __init__(self, input_ids, input_mask, segment_ids, label_id):
+    def __init__(self, input_ids, input_mask, segment_ids, label_id,
+                 relation_matrix):
         self.input_ids = input_ids
         self.input_mask = input_mask
         self.segment_ids = segment_ids
         self.label_id = label_id
+        self.relation_matrix = relation_matrix
+        # self.relation_id = relation_id
+        # self.relation_objects = relation_objects
 
 
-def readfile(filename):
+def readfile_relation(filename):
     '''
     read file
     return format :
@@ -71,48 +84,44 @@ def readfile(filename):
     data = []
     sentence = []
     label = []
+    relation = []
+    relation_object = []
     for line in f:
-        if len(line) == 0 or line.startswith('-DOCSTART') or line[0] == "\n":
+        if len(line) == 0 or line.startswith('#doc') or line[0] == "\n":
             if len(sentence) > 0:
-                data.append((sentence, label))
+                data.append((sentence, label, relation, relation_object))
                 sentence = []
                 label = []
+                relation = []
+                relation_object = []
             continue
-        splits = line.split(' ')
-        sentence.append(splits[0])
+        splits = line.split('\t')
+        sentence.append(splits[1])
         # eliminate \n
-        label.append(splits[-1][:-1])
+        label.append(splits[2])
+        r = splits[3][1:-1]
+        s = r.split(', ')  # some word has more than one relation
+        for i in range(len(s)):
+            s[i] = s[i][1:-1]  # eliminate "
+        relation.append(s)
+        ro = splits[4][1:-2]
+        so = ro.split(', ')  # some word has more than one relation object
+        for i in range(len(so)):
+            so[i] = int(so[i])
+        relation_object.append(so)
+        assert (len(s) == len(so))
 
     if len(sentence) > 0:
-        data.append((sentence, label))
+        data.append((sentence, label, relation, relation_object))
         sentence = []
         label = []
+        relation = []
+        relation_object = []
     return data
 
 
-class DataProcessor(object):
-    """Base class for data converters for sequence classification data sets."""
-
-    def get_train_examples(self, data_dir):
-        """Gets a collection of `InputExample`s for the train set."""
-        raise NotImplementedError()
-
-    def get_dev_examples(self, data_dir):
-        """Gets a collection of `InputExample`s for the dev set."""
-        raise NotImplementedError()
-
-    def get_labels(self):
-        """Gets the list of labels for this data set."""
-        raise NotImplementedError()
-
-    @classmethod
-    def _read_tsv(cls, input_file, quotechar=None):
-        """Reads a tab separated value file."""
-        return readfile(input_file)
-
-
-class NerProcessor(DataProcessor):
-    """Processor for the CoNLL-2003 data set."""
+class RelationProcessor(DataProcessor):
+    """Processor for the CoNLL-2004 data set."""
 
     def get_train_examples(self, data_dir):
         """See base class."""
@@ -122,7 +131,7 @@ class NerProcessor(DataProcessor):
     def get_dev_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "valid.txt")), "dev")
+            self._read_tsv(os.path.join(data_dir, "dev.txt")), "dev")
 
     def get_test_examples(self, data_dir):
         """See base class."""
@@ -131,63 +140,126 @@ class NerProcessor(DataProcessor):
 
     def get_labels(self):
         return [
-            "O", "B-MISC", "I-MISC", "B-PER", "I-PER", "B-ORG", "I-ORG",
-            "B-LOC", "I-LOC", "X", "[CLS]", "[SEP]"
+            'I-Loc', 'B-Org', 'I-Org', 'B-Other', 'B-Peop', 'I-Peop', 'B-Loc',
+            'O', 'I-Other', '[CLS]', '[SEP]', 'X'
+        ]
+
+    def get_relations(self):
+        return [
+            'N', 'Live_In', 'Located_In', 'Work_For', 'OrgBased_In', 'Kill'
         ]
 
     def _create_examples(self, lines, set_type):
         examples = []
-        for i, (sentence, label) in enumerate(lines):
+        for i, (sentence, label, relation,
+                relation_object) in enumerate(lines):
             guid = "%s-%s" % (set_type, i)
             text_a = ' '.join(sentence)
             text_b = None
             label = label
+            relation = relation
+            relation_object = relation_object
+
             examples.append(
                 InputExample(guid=guid,
                              text_a=text_a,
                              text_b=text_b,
-                             label=label))
+                             label=label,
+                             relation=relation,
+                             relation_object=relation_object))
         return examples
 
+    @classmethod
+    def _read_tsv(cls, input_file, quotechar=None):
+        """Reads a tab separated value file."""
+        return readfile_relation(
+            input_file
+        )  # num_sentences * (sentence, label, relation, relation_object)
 
-def convert_examples_to_features(examples, label_list, max_seq_length,
-                                 tokenizer):
+
+def convert_examples_to_features(examples, label_list, relation_list,
+                                 max_seq_length, tokenizer):
     """Loads a data file into a list of `InputBatch`s."""
 
     # save 0 for the positions less than max length
     label_map = {label: i for i, label in enumerate(label_list, 1)}
+    relation_map = {
+        r: i
+        for i, r in enumerate(relation_list)
+    }  # relation[0] is 'N', which means no relation, suitable for padding mask
 
     features = []
     for (ex_index, example) in enumerate(examples):
         textlist = example.text_a.split(' ')
+        idx_word = dict()
         labellist = example.label
+        relationlist = example.relation
+        relationobjectlist = example.relation_object
         tokens = []
         labels = []
+        relations = []
+        relation_objects = []
+        idx = 0  # the index of the real tokens
         for i, word in enumerate(textlist):
+            idx_word[i] = idx
             token = tokenizer.tokenize(word)
             tokens.extend(token)
             label_1 = labellist[i]
+            relation_1 = relationlist[i]
+            relation_object_1 = relationobjectlist[i]
             for m in range(len(token)):
                 if m == 0:
                     labels.append(label_1)
+                    relations.append(relation_1)
+                    relation_objects.append(relation_object_1)
                 else:
                     labels.append("X")
+                    relations.append(['N'])
+                    relation_objects.append([i + m])
+                idx += 1
+        for i in range(len(relations)):
+            if relations[i] != ['N']:
+                for j in range(len(relation_objects[i])):
+                    relation_objects[i][j] = idx_word[relation_objects[i][j]]
+            else:
+                for j in range(len(relation_objects[i])):
+                    relation_objects[i][j] = i + j
+        # [CLS] is the first one so add 1
+        for i in range(len(relations)):
+            for j in range(len(relation_objects[i])):
+                relation_objects[i][j] += 1
         if len(tokens) >= max_seq_length - 1:
             tokens = tokens[0:(max_seq_length - 2)]
             labels = labels[0:(max_seq_length - 2)]
+            relations = relations[0:(max_seq_length - 2)]
+            relation_objects = relation_objects[0:(max_seq_length - 2)]
         ntokens = []
         segment_ids = []
         label_ids = []
+        relation_ids = []
+        nrelation_objects = []
+
         ntokens.append("[CLS]")
         segment_ids.append(0)
         label_ids.append(label_map["[CLS]"])
+        relation_ids.append([relation_map['N']])
+        nrelation_objects.append([0])
+
         for i, token in enumerate(tokens):
             ntokens.append(token)
             segment_ids.append(0)
             label_ids.append(label_map[labels[i]])
+            current_relation = []
+            for r in relations[i]:
+                current_relation.append(relation_map[r])
+            relation_ids.append(current_relation)
+            nrelation_objects.append(relation_objects[i])
         ntokens.append("[SEP]")
         segment_ids.append(0)
         label_ids.append(label_map["[SEP]"])
+        relation_ids.append([relation_map['N']])
+        nrelation_objects.append([len(ntokens) - 1])
+
         input_ids = tokenizer.convert_tokens_to_ids(ntokens)
         input_mask = [1] * len(input_ids)
         while len(input_ids) < max_seq_length:
@@ -195,29 +267,68 @@ def convert_examples_to_features(examples, label_list, max_seq_length,
             input_mask.append(0)
             segment_ids.append(0)
             label_ids.append(0)
+            relation_ids.append([0])
+            nrelation_objects.append([len(input_ids) - 1])
         assert len(input_ids) == max_seq_length
         assert len(input_mask) == max_seq_length
         assert len(segment_ids) == max_seq_length
         assert len(label_ids) == max_seq_length
+        assert len(relation_ids) == max_seq_length
+        assert len(nrelation_objects) == max_seq_length
 
-        if ex_index < 5:
-            logger.info("*** Example ***")
-            logger.info("guid: %s" % (example.guid))
-            logger.info("tokens: %s" % " ".join([str(x) for x in tokens]))
-            logger.info("input_ids: %s" % " ".join([str(x)
-                                                    for x in input_ids]))
-            logger.info("input_mask: %s" %
-                        " ".join([str(x) for x in input_mask]))
-            logger.info("segment_ids: %s" %
-                        " ".join([str(x) for x in segment_ids]))
-            # logger.info("label: %s (id = %d)" % (example.label, label_ids))
+        # if ex_index < 5:
+        #     logger.info("*** Example ***")
+        #     logger.info("guid: %s" % (example.guid))
+        #     logger.info("tokens: %s" % " ".join([str(x) for x in tokens]))
+        #     logger.info("input_ids: %s" % " ".join([str(x)
+        #                                             for x in input_ids]))
+        #     logger.info("input_mask: %s" %
+        #                 " ".join([str(x) for x in input_mask]))
+        #     logger.info("segment_ids: %s" %
+        #                 " ".join([str(x) for x in segment_ids]))
+        #     # logger.info("label: %s (id = %d)" % (example.label, label_ids))
+        #     # logger.info("relation: %s" %
+        #     #             " ".join([l for l in relation_ids]))
+        #     # logger.info("relation_o: %s" %
+        #     #             " ".join([l for l in nrelation_objects]))
+        #     re = "relation:"
+        #     for r in relation_ids:
+        #         re += ' ' + str(r)
+        #     logger.info(re)
+        #     reo = "relation_objects:"
+        #     for r in nrelation_objects:
+        #         reo += ' ' + str(r)
+        #     logger.info(reo)
+
+        # gold_relations = torch.zeros(max_seq_length, max_seq_length,
+        #                              len(relation_map))
+        gold_relations = [[[0] * len(relation_map)] * max_seq_length] * max_seq_length
+        for i, rr in enumerate(relation_ids):
+            for j, r in enumerate(rr):
+                ob = nrelation_objects[i][j]
+                gold_relations[i][ob][r] = 1
 
         features.append(
             InputFeatures(input_ids=input_ids,
                           input_mask=input_mask,
                           segment_ids=segment_ids,
-                          label_id=label_ids))
+                          label_id=label_ids,
+                          relation_matrix=gold_relations))
+        #                  relation_id=relation_ids,
+        #                  relation_objects=nrelation_objects))
     return features
+
+
+# processor = RelationProcessor()
+# re = relation_extracter('out/', 100, 6)
+# train_e = processor.get_train_examples('CoNLL04/')
+# f = convert_examples_to_features(train_e, label_list, relation_list, 128, re.tokeniser)
+# f1 = f[1]
+# m = f1.relation_matrix
+# print(m[0][0][0])
+# print(m[3][3][0])
+# print(m[7][28][3])
+# print(m[7][12][1])
 
 
 def main():
@@ -229,28 +340,24 @@ def main():
         default=None,
         type=str,
         required=True,
-        help="The input data dir. Should contain the .tsv files (or other data files) for the task."
+        help=
+        "The input data dir. Should contain the .tsv files (or other data files) for the task."
     )
     parser.add_argument(
-        "--bert_model",
-        default=None,
+        "--model_dir",
+        default='out/',
         type=str,
         required=True,
-        help="Bert pre-trained model selected in the list: bert-base-uncased, "
-        "bert-large-uncased, bert-base-cased, bert-large-cased, bert-base-multilingual-uncased, "
-        "bert-base-multilingual-cased, bert-base-chinese.")
-    parser.add_argument(
-        "--task_name",
-        default=None,
-        type=str,
-        required=True,
-        help="The name of the task to train.")
+        help=
+        "Dir of the trained Ner model."
+    )
     parser.add_argument(
         "--output_dir",
         default=None,
         type=str,
         required=True,
-        help="The output directory where the model predictions and checkpoints will be written."
+        help=
+        "The output directory where the model predictions and checkpoints will be written."
     )
 
     # Other parameters
@@ -258,71 +365,66 @@ def main():
         "--cache_dir",
         default="",
         type=str,
-        help="Where do you want to store the pre-trained models downloaded from s3")
+        help=
+        "Where do you want to store the pre-trained models downloaded from s3")
     parser.add_argument(
         "--max_seq_length",
         default=128,
         type=int,
-        help="The maximum total input sequence length after WordPiece tokenization. \n"
-             "Sequences longer than this will be truncated, and sequences shorter \n"
-             "than this will be padded.")
-    parser.add_argument(
-        "--do_train",
-        action='store_true',
-        help="Whether to run training.")
-    parser.add_argument(
-        "--do_eval",
-        action='store_true',
-        help="Whether to run eval on the dev set.")
+        help=
+        "The maximum total input sequence length after WordPiece tokenization. \n"
+        "Sequences longer than this will be truncated, and sequences shorter \n"
+        "than this will be padded.")
+    parser.add_argument("--do_train",
+                        action='store_true',
+                        help="Whether to run training.")
+    parser.add_argument("--do_eval",
+                        action='store_true',
+                        help="Whether to run eval on the dev set.")
     parser.add_argument(
         "--do_lower_case",
         action='store_true',
         help="Set this flag if you are using an uncased model.")
-    parser.add_argument(
-        "--train_batch_size",
-        default=32,
-        type=int,
-        help="Total batch size for training.")
-    parser.add_argument(
-        "--eval_batch_size",
-        default=8,
-        type=int,
-        help="Total batch size for eval.")
-    parser.add_argument(
-        "--learning_rate",
-        default=5e-5,
-        type=float,
-        help="The initial learning rate for Adam.")
-    parser.add_argument(
-        "--num_train_epochs",
-        default=3.0,
-        type=float,
-        help="Total number of training epochs to perform.")
+    parser.add_argument("--train_batch_size",
+                        default=8,
+                        type=int,
+                        help="Total batch size for training.")
+    parser.add_argument("--eval_batch_size",
+                        default=8,
+                        type=int,
+                        help="Total batch size for eval.")
+    parser.add_argument("--learning_rate",
+                        default=5e-5,
+                        type=float,
+                        help="The initial learning rate for Adam.")
+    parser.add_argument("--num_train_epochs",
+                        default=3.0,
+                        type=float,
+                        help="Total number of training epochs to perform.")
     parser.add_argument(
         "--warmup_proportion",
         default=0.1,
         type=float,
-        help="Proportion of training to perform linear learning rate warmup for. "
-             "E.g., 0.1 = 10%% of training.")
-    parser.add_argument(
-        "--no_cuda",
-        action='store_true',
-        help="Whether not to use CUDA when available")
-    parser.add_argument(
-        "--local_rank",
-        type=int,
-        default=-1,
-        help="local_rank for distributed training on gpus")
-    parser.add_argument(
-        '--seed',
-        type=int,
-        default=42,
-        help="random seed for initialization")
+        help=
+        "Proportion of training to perform linear learning rate warmup for. "
+        "E.g., 0.1 = 10%% of training.")
+    parser.add_argument("--no_cuda",
+                        action='store_true',
+                        help="Whether not to use CUDA when available")
+    parser.add_argument("--local_rank",
+                        type=int,
+                        default=-1,
+                        help="local_rank for distributed training on gpus")
+    parser.add_argument('--seed',
+                        type=int,
+                        default=42,
+                        help="random seed for initialization")
     parser.add_argument(
         '--gradient_accumulation_steps',
         type=int,
         default=1,
-        help="Number of updates steps to accumulate before performing a backward/update pass."
+        help=
+        "Number of updates steps to accumulate before performing a backward/update pass."
     )
     parser.add_argument(
         '--fp16',
@@ -332,19 +434,18 @@ def main():
         '--loss_scale',
         type=float,
         default=0,
-        help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
-             "0 (default value): dynamic loss scaling.\n"
-             "Positive power of 2: static loss scaling value.\n")
-    parser.add_argument(
-        '--server_ip',
-        type=str,
-        default='',
-        help="Can be used for distant debugging.")
-    parser.add_argument(
-        '--server_port',
-        type=str,
-        default='',
-        help="Can be used for distant debugging.")
+        help=
+        "Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
+        "0 (default value): dynamic loss scaling.\n"
+        "Positive power of 2: static loss scaling value.\n")
+    parser.add_argument('--server_ip',
+                        type=str,
+                        default='',
+                        help="Can be used for distant debugging.")
+    parser.add_argument('--server_port',
+                        type=str,
+                        default='',
+                        help="Can be used for distant debugging.")
     args = parser.parse_args()
 
     if args.server_ip and args.server_port:
@@ -355,18 +456,18 @@ def main():
                             redirect_output=True)
         ptvsd.wait_for_attach()
 
-    processors = {"ner": NerProcessor}
-
     if args.local_rank == -1 or args.no_cuda:
         device = torch.device("cuda" if torch.cuda.is_available()
                               and not args.no_cuda else "cpu")
-        n_gpu = torch.cuda.device_count()
+        # n_gpu = torch.cuda.device_count()
+        n_gpu = 1  # in case tensor in different gpu
     else:
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
         n_gpu = 1
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.distributed.init_process_group(backend='nccl')
+
     logger.info(
         "device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".
         format(device, n_gpu, bool(args.local_rank != -1), args.fp16))
@@ -393,18 +494,8 @@ def main():
                 args.output_dir))
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
-
-    task_name = args.task_name.lower()
-
-    if task_name not in processors:
-        raise ValueError("Task not found: %s" % (task_name))
-
-    processor = processors[task_name]()
-    label_list = processor.get_labels()
-    num_labels = len(label_list) + 1
-
-    tokenizer = BertTokenizer.from_pretrained(args.bert_model,
-                                              do_lower_case=args.do_lower_case)
+    
+    processor = RelationProcessor()
 
     train_examples = None
     num_train_optimization_steps = None
@@ -416,75 +507,42 @@ def main():
         if args.local_rank != -1:
             num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size(
             )
-    print("num_train_optimization_steps: ", num_train_optimization_steps)
+    print("num_train_optimization_steps", num_train_optimization_steps)
 
-    # Prepare model
-    cache_dir = args.cache_dir if args.cache_dir else os.path.join(
-        str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed_{}'.format(
-            args.local_rank))
-    model = BertForTokenClassification.from_pretrained(args.bert_model,
-                                                       cache_dir=cache_dir,
-                                                       num_labels=num_labels)
-    if args.fp16:
-        model.half()
+    n_classes = len(relation_list)  # num of relations
+    transitional_size = 100  # size of transitional layer
+    model = relation_extracter('out/', transitional_size, n_classes)
+
+    tokenizer = model.tokeniser
+    max_seq_length = model.max_seq_length
+
     model.to(device)
-    if args.local_rank != -1:
-        try:
-            from apex.parallel import DistributedDataParallel as DDP
-        except ImportError:
-            raise ImportError(
-                "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training."
-            )
 
-        model = DDP(model)
-    elif n_gpu > 1:
+    if n_gpu > 1:
         model = torch.nn.DataParallel(model)
 
     param_optimizer = list(model.named_parameters())
-    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [{
         'params':
-        [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
-        'weight_decay':
-        0.01
-    }, {
-        'params':
-        [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
+        [p for n, p in param_optimizer if not any(nd in n for nd in ['bert'])],
         'weight_decay':
         0.0
     }]
-    if args.fp16:
-        try:
-            from apex.optimizers import FP16_Optimizer
-            from apex.optimizers import FusedAdam
-        except ImportError:
-            raise ImportError(
-                "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training."
-            )
 
-        optimizer = FusedAdam(optimizer_grouped_parameters,
-                              lr=args.learning_rate,
-                              bias_correction=False,
-                              max_grad_norm=1.0)
-        if args.loss_scale == 0:
-            optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
-        else:
-            optimizer = FP16_Optimizer(optimizer,
-                                       static_loss_scale=args.loss_scale)
-
-    else:
-        optimizer = BertAdam(optimizer_grouped_parameters,
-                             lr=args.learning_rate,
-                             warmup=args.warmup_proportion,
-                             t_total=num_train_optimization_steps)
+    optimizer = BertAdam(optimizer_grouped_parameters,
+                         lr=args.learning_rate,
+                         warmup=args.warmup_proportion,
+                         t_total=num_train_optimization_steps)
 
     global_step = 0
     nb_tr_steps = 0
     tr_loss = 0
+
     if args.do_train:
         train_features = convert_examples_to_features(train_examples,
                                                       label_list,
-                                                      args.max_seq_length,
+                                                      relation_list,
+                                                      max_seq_length,
                                                       tokenizer)
         logger.info("***** Running training *****")
         logger.info("  Num examples = %d", len(train_examples))
@@ -498,8 +556,14 @@ def main():
                                        dtype=torch.long)
         all_label_ids = torch.tensor([f.label_id for f in train_features],
                                      dtype=torch.long)
-        train_data = TensorDataset(all_input_ids, all_input_mask,
-                                   all_segment_ids, all_label_ids)
+        all_relation_matrices = torch.tensor([f.relation_matrix for f in train_features],
+                                             dtype=torch.long)
+        train_data = TensorDataset(all_input_ids,
+                                   all_input_mask,
+                                   all_segment_ids,
+                                   all_label_ids,
+                                   all_relation_matrices)
+        
         if args.local_rank == -1:
             train_sampler = RandomSampler(train_data)
         else:
@@ -507,7 +571,7 @@ def main():
         train_dataloader = DataLoader(train_data,
                                       sampler=train_sampler,
                                       batch_size=args.train_batch_size)
-
+        
         model.train()
         for _ in trange(int(args.num_train_epochs), desc="Epoch"):
             tr_loss = 0
@@ -515,13 +579,13 @@ def main():
             for step, batch in enumerate(
                     tqdm(train_dataloader, desc="Iteration")):
                 batch = tuple(t.to(device) for t in batch)
-                input_ids, input_mask, segment_ids, label_ids = batch
-                loss = model(input_ids, segment_ids, input_mask, label_ids)
+                input_ids, input_mask, segment_ids, label_ids, relarion_matrices = batch
+                relarion_matrices = relarion_matrices.float()
+                loss = model(input_ids, segment_ids, input_mask, label_ids, relarion_matrices)["loss"]
                 if n_gpu > 1:
                     loss = loss.mean()  # mean() to average on multi-gpu.
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
-
                 if args.fp16:
                     optimizer.backward(loss)
                 else:
@@ -544,30 +608,14 @@ def main():
                     global_step += 1
 
         # Save a trained model and the associated configuration
-        model_to_save = model.module if hasattr(
-            model, 'module') else model  # Only save the model it-self
-        output_model_file = os.path.join(args.output_dir, WEIGHTS_NAME)
-        torch.save(model_to_save.state_dict(), output_model_file)
-        output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
-        with open(output_config_file, 'w') as f:
-            f.write(model_to_save.config.to_json_string())
-        label_map = {i: label for i, label in enumerate(label_list, 1)}
-        model_config = {
-            "bert_model": args.bert_model,
-            "do_lower": args.do_lower_case,
-            "max_seq_length": args.max_seq_length,
-            "num_labels": len(label_list) + 1,
-            "label_map": label_map
-        }
-        json.dump(
-            model_config,
-            open(os.path.join(args.output_dir, "model_config.json"), "w"))
-        # Load a trained model and config that you have fine-tuned
+        # model_to_save = model.module if hasattr(
+        #     model, 'module') else model  # Only save the model it-self
+        output_model_file = os.path.join(args.output_dir, 'ner_re.bin')
+        torch.save(model.state_dict(), output_model_file)
+
+    # Load a trained model and config that you have fine-tuned
     else:
-        output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
-        output_model_file = os.path.join(args.output_dir, WEIGHTS_NAME)
-        config = BertConfig(output_config_file)
-        model = BertForTokenClassification(config, num_labels=num_labels)
+        output_model_file = os.path.join(args.output_dir, 'ner_re.bin')
         model.load_state_dict(torch.load(output_model_file))
 
     model.to(device)
@@ -575,8 +623,10 @@ def main():
     if args.do_eval and (args.local_rank == -1
                          or torch.distributed.get_rank() == 0):
         eval_examples = processor.get_dev_examples(args.data_dir)
-        eval_features = convert_examples_to_features(eval_examples, label_list,
-                                                     args.max_seq_length,
+        eval_features = convert_examples_to_features(eval_examples,
+                                                     label_list,
+                                                     relation_list,
+                                                     max_seq_length,
                                                      tokenizer)
         logger.info("***** Running evaluation *****")
         logger.info("  Num examples = %d", len(eval_examples))
@@ -589,8 +639,13 @@ def main():
                                        dtype=torch.long)
         all_label_ids = torch.tensor([f.label_id for f in eval_features],
                                      dtype=torch.long)
-        eval_data = TensorDataset(all_input_ids, all_input_mask,
-                                  all_segment_ids, all_label_ids)
+        all_relation_matrices = torch.tensor([f.relation_matrix for f in eval_features],
+                                             dtype=torch.long)
+        eval_data = TensorDataset(all_input_ids,
+                                  all_input_mask,
+                                  all_segment_ids,
+                                  all_label_ids,
+                                  all_relation_matrices)
         # Run prediction for full data
         eval_sampler = SequentialSampler(eval_data)
         eval_dataloader = DataLoader(eval_data,
@@ -602,42 +657,23 @@ def main():
         y_true = []
         y_pred = []
         label_map = {i: label for i, label in enumerate(label_list, 1)}
-        for input_ids, input_mask, segment_ids, label_ids in tqdm(
+        for input_ids, input_mask, segment_ids, label_ids, relarion_matrices in tqdm(
                 eval_dataloader, desc="Evaluating"):
             input_ids = input_ids.to(device)
             input_mask = input_mask.to(device)
             segment_ids = segment_ids.to(device)
             label_ids = label_ids.to(device)
+            relarion_matrices = relarion_matrices.float()
+            relarion_matrices = relarion_matrices.to(device)
 
             with torch.no_grad():
-                logits = model(input_ids, segment_ids, input_mask)
+                output_dict = model(input_ids, segment_ids, input_mask, label_ids, relarion_matrices)
 
-            logits = torch.argmax(F.log_softmax(logits, dim=2), dim=2)
-            logits = logits.detach().cpu().numpy()
-            label_ids = label_ids.to('cpu').numpy()
-            input_mask = input_mask.to('cpu').numpy()
-            for i, mask in enumerate(input_mask):
-                temp_1 = []
-                temp_2 = []
-                for j, m in enumerate(mask):
-                    if j == 0:
-                        continue
-                    if m:
-                        if label_map[label_ids[i][j]] != "X":
-                            temp_1.append(label_map[label_ids[i][j]])
-                            temp_2.append(label_map[logits[i][j]])
-                    else:
-                        temp_1.pop()
-                        temp_2.pop()
-                        break
-                y_true.append(temp_1)
-                y_pred.append(temp_2)
-        report = classification_report(y_true, y_pred, digits=4)
         output_eval_file = os.path.join(args.output_dir, "eval_results.txt")
         with open(output_eval_file, "w") as writer:
             logger.info("***** Eval results *****")
-            logger.info("\n%s", report)
-            writer.write(report)
+            logger.info("\n%s", model.get_metrics())
+            writer.write(str(model.get_metrics()))
 
 
 if __name__ == "__main__":
